@@ -1,7 +1,8 @@
 # Python
 __pycache__/
 *.py[cod]
-*.egg-info/
+.pytest_cache/
+.ruff_cache/
 
 # Virtual environment
 .venv/
@@ -23,6 +24,7 @@ logs/
 
 # Airflow
 airflow/logs/
+airflow.cfg
 
 # OS
 .DS_Store

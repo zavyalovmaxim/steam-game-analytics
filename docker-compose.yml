@@ -1,0 +1,251 @@
+services:
+  minio:
+    image: minio/minio:latest
+    container_name: steam-analytics-minio
+    restart: unless-stopped
+
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+
+    volumes:
+      - minio_data:/data
+
+    command: server /data --console-address ":9001"
+
+    healthcheck:
+      test:
+        - CMD
+        - curl
+        - --fail
+        - http://localhost:9000/minio/health/live
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+    networks:
+      - steam-analytics-network
+
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    container_name: steam-analytics-clickhouse
+    restart: unless-stopped
+
+    ports:
+      - "8123:8123"
+      - "9002:9000"
+
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ./warehouse/ddl:/docker-entrypoint-initdb.d:ro
+
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >
+          wget --quiet --spider
+          --user="${CLICKHOUSE_USER}"
+          --password="${CLICKHOUSE_PASSWORD}"
+          http://localhost:8123/ping
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+    networks:
+      - steam-analytics-network
+
+
+  airflow-postgres:
+    image: postgres:16
+    container_name: steam-airflow-postgres
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+
+    volumes:
+      - airflow_postgres_data:/var/lib/postgresql/data
+
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U airflow -d airflow
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+    networks:
+      - steam-analytics-network
+
+
+  airflow-init:
+    user: "50000:0"
+    build:
+      context: .
+      dockerfile: airflow/Dockerfile
+
+    container_name: steam-airflow-init
+
+    depends_on:
+      airflow-postgres:
+        condition: service_healthy
+
+    environment: &airflow-environment
+      AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-api-server:8080/execution/
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+      AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET:?AIRFLOW_JWT_SECRET is required}
+      AIRFLOW__CORE__PARALLELISM: "4"
+
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: >-
+        postgresql+psycopg2://airflow:airflow@airflow-postgres:5432/airflow
+
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+      MINIO_BUCKET_RAW: ${MINIO_BUCKET_RAW}
+      MINIO_REGION: ${MINIO_REGION:-us-east-1}
+
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: "8123"
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+
+      PYTHONPATH: /opt/airflow/project/src
+
+    volumes: &airflow-volumes
+      - ./dags:/opt/airflow/dags
+      - ./logs:/opt/airflow/logs
+      - ./scripts:/opt/airflow/project/scripts
+      - ./src:/opt/airflow/project/src
+
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - airflow db migrate
+
+    networks:
+      - steam-analytics-network
+
+
+  airflow-api-server:
+    user: "${AIRFLOW_UID:-50000}:0"
+    build:
+      context: .
+      dockerfile: airflow/Dockerfile
+
+    container_name: steam-airflow-api-server
+    restart: unless-stopped
+
+    depends_on:
+      airflow-postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+    environment:
+      <<: *airflow-environment
+
+    volumes: *airflow-volumes
+
+    ports:
+      - "8080:8080"
+
+    command: api-server
+
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - curl --fail http://localhost:8080/api/v2/monitor/health
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+    networks:
+      - steam-analytics-network
+
+
+  airflow-scheduler:
+    user: "${AIRFLOW_UID:-50000}:0"
+    build:
+      context: .
+      dockerfile: airflow/Dockerfile
+
+    container_name: steam-airflow-scheduler
+    restart: unless-stopped
+
+    depends_on:
+      airflow-postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+      minio:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+
+    environment:
+      <<: *airflow-environment
+
+    volumes: *airflow-volumes
+
+    command: scheduler
+
+    networks:
+      - steam-analytics-network
+
+
+  airflow-dag-processor:
+    user: "${AIRFLOW_UID:-50000}:0"
+    build:
+      context: .
+      dockerfile: airflow/Dockerfile
+
+    container_name: steam-airflow-dag-processor
+    restart: unless-stopped
+
+    depends_on:
+      airflow-postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+    environment:
+      <<: *airflow-environment
+
+    volumes: *airflow-volumes
+
+    command: dag-processor
+
+    networks:
+      - steam-analytics-network
+
+
+volumes:
+  minio_data:
+    name: steam-analytics-minio-data
+
+  clickhouse_data:
+    name: steam-analytics-clickhouse-data
+
+  airflow_postgres_data:
+    name: steam-analytics-airflow-postgres-data
+
+
+networks:
+  steam-analytics-network:
+    external: true
+    name: steam-analytics-network
