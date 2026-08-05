@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import time
@@ -245,6 +246,17 @@ def main() -> int:
         "Steam ingestion finished: success=%s failure=%s",
         success_count,
         failure_count,
+    )
+
+    result = {
+        "extracted_rows": success_count,
+        "source_file_count": success_count,
+        "failed_rows": failure_count,
+    }
+    print(
+        "PIPELINE_RESULT="
+        + json.dumps(result, separators=(",", ":"), sort_keys=True),
+        flush=True,
     )
 
     return 1 if failure_count else 0
